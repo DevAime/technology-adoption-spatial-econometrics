@@ -1,0 +1,393 @@
+---
+title: "Nairobi Companies Technologies Adoption :Spatial Durbin's Model"
+author: "Aime Muganga"
+date: "2025-07-16"
+output:
+  word_document: default
+  html_document: default
+---
+
+
+
+## Preparation of the data
+
+### Loading Packages
+
+```{r}
+library(readr)
+library(geodata)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(ggplot2)
+
+```
+
+### Loading the data
+
+```{r}
+Combined_Data<-read.csv("C:/Users/aimmu/OneDrive/Bureau/STA3010/Combined_Data.csv")
+
+```
+
+
+### Reading the spatial data about Nairobi Subcounty from the GeoJSON File
+
+```{r}
+kenya_spatial_data <-
+st_read("C:/Users/aimmu/Downloads/gadm41_KEN_shp/gadm41_KEN_2.shp")
+
+nairobi_spatial_data <- kenya_spatial_data %>%
+ filter(NAME_1 == "Nairobi")
+nairobi_spatial_data$NAME_2
+```
+
+### Harmonizing SubCounty Names
+
+```{r}
+nairobi_spatial_data <- nairobi_spatial_data %>%
+ mutate(NAME_2 = case_when(
+ grepl("Dagoretti", NAME_2, ignore.case = TRUE) ~ "Dagoreti",
+ grepl("Embakasi", NAME_2, ignore.case = TRUE) ~ "Embakasi",
+ TRUE ~ NAME_2
+ ))
+
+```
+
+### Apply Group by SubCounty Names and Aggregate to Geometry
+
+```{r}
+nairobi_agg <- nairobi_spatial_data %>%
+  group_by(NAME_2) %>%
+  summarise(geometry = st_union(geometry))
+
+```
+
+
+### Recode ordinal levels from strings to numeric values
+
+```{r}
+levels <- c("Very Low" = 1, "Low" = 2, "Medium" = 3, "High" = 4, "Very High" = 5)
+
+
+recode_vars <- c("y","y_11","y_12","y_13", "x_1", "x_2", "x_3")  
+
+for (var in recode_vars) {
+  Combined_Data[[var]] <- as.numeric(recode(Combined_Data[[var]], !!!levels))
+}
+```
+
+### Convert binary categorical variables to 0/1
+
+```{r}
+Combined_Data$x_4 <- ifelse(Combined_Data$x_4 == "Yes", 1, 0)
+
+Combined_Data$x_6 <- ifelse(Combined_Data$x_6 == "Online business", 1, 0)  
+```
+
+### Merging Spatial and Attribute Data
+
+```{r}
+data_merged <- nairobi_agg %>%
+ left_join(Combined_Data, by = c("NAME_2" = "ADM2_EN"))
+
+data_merged <- st_transform(data_merged, crs = 21037)
+```
+
+
+```{r}
+data_merged <- data_merged[!is.na(data_merged$y), ]
+
+```
+
+
+### Mapping of Nairobi Subcounties
+
+```{r}
+ggplot(data = data_merged) +
+ geom_sf(fill = "lightblue", color = "black") +
+ geom_sf_text(aes(label = NAME_2), size = 3) +
+ labs(title = "Map of Nairobi Subcounties with Names") +
+ theme_minimal()
+
+```
+
+
+`
+
+
+
+## Building the Spatial Durbin Models
+
+Before developing the Spatial Durbin Models (SDMs), we first perform Moran’s I tests on each dependent variable to assess whether there is spatial autocorrelation—i.e., whether similar values tend to cluster geographically. If significant spatial dependence is detected, we proceed with fitting an SDM to account for both direct and spillover effects. We examine four dependent variables, each reflecting a unique aspect of technology adaptation among companies in Nairobi: Adoption (overall level of new technology uptake), Access (availability of technology), Openness (willingness and receptiveness toward technology), and Coping (ability to handle modern technological changes). By modeling each separately, we can better understand how factors like ICT competency, training, digital transformation mastery, and financing influence the various dimensions of adaptation across space
+
+
+### Ordinary Least Squares (OLS) Baseline Models
+
+Before constructing the Spatial Durbin Models, we begin by fitting four separate Ordinary Least Squares (OLS) regression models—one for each dependent variable: **Adoption**, **Access**, **Openness**, and **Coping**. These models serve as baseline specifications to evaluate how well the explanatory variables predict each outcome without accounting for spatial effects. By calculating the Akaike Information Criterion (AIC) for each model, we can assess and compare their goodness-of-fit. This step also allows us to determine whether incorporating spatial dependence (through the SDM) meaningfully improves model performance.
+
+
+```{r}
+
+# OLS Models using data_merged
+
+ols_adoption <- lm(y ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+ols_access   <- lm(y_11 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+ols_openness <- lm(y_12 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+ols_coping   <- lm(y_13 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+
+# Compare AIC values
+aic_results <- data.frame(
+  Model = c("Adoption", "Access", "Openness", "Coping"),
+  AIC = c(AIC(ols_adoption), AIC(ols_access), AIC(ols_openness), AIC(ols_coping))
+)
+
+print(aic_results)
+
+
+
+```
+
+
+
+
+
+
+## Spatial Durbin Models
+
+We now proceed to build our Models for each of the four dependent variables: Adoption, Access, Openness, and Coping. 
+
+#### Creation of the Spatial Weights Matrix
+
+To account for spatial relationships between subcounties, we first constructed a neighbor list using the poly2nb function, which identifies neighboring subcounties based on shared borders. This neighbor list was then converted into a spatial weights matrix using the nb2listw function with row-standardized weights (style = "W"). This ensures that the influence of each neighboring area is proportionally scaled, allowing for meaningful spatial analysis in the subsequent models. The resulting spatial weights matrix (lw) is a key component in capturing spatial dependencies within the Spatial Durbin Models.
+
+```{r}
+nb <- poly2nb(data_merged)
+lw <- nb2listw(nb, style = "W")
+```
+
+
+
+### Model one: Spatial Durbin Model for Adoption
+
+#### Map of Adoption in different counties
+
+```{r}
+library(ggplot2)
+# Transform to UTM Zone 37S (EPSG:21037) for Kenya
+merged_clean_proj <- st_transform(data_merged, crs = 21037)
+ggplot(data = data_merged) +
+ geom_sf(aes(fill = y), color = "black") +
+ # Add subcounty names as labels
+ geom_sf_text(aes(label = NAME_2), size = 3, color = "black") +
+ scale_fill_viridis_c(option = "plasma") + # for nice gradient colors
+ labs(title = "Level of Adoption to New Technology by Subcounty in Nairobi",
+ fill = "Adoption") +
+ theme_minimal()
+```
+
+
+
+#### Moran's I Test before modeling
+
+```{r}
+moran_adoption <- moran.test(data_merged$y, lw)
+print(moran_adoption)
+```
+For the first model, where Adoption is the dependent variable, the Moran’s I test yields a statistic of -0.0025 with a high p-value of 0.9236, indicating no significant spatial autocorrelation. This suggests that the level of technology adoption among companies in Nairobi is not spatially clustered. Therefore, there is no justification for fitting a Spatial Durbin Model (SDM) for this outcome, as spatial effects are not present. Instead, we opt to use a standard Ordinary Least Squares (OLS) regression model to examine the factors influencing technology adoption.
+
+#### OLS Model for Adaption
+
+
+```{r}
+ols_adoption <- lm(y ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+summary(ols_adoption)
+```
+
+The OLS regression model explains approximately 66.25% of the variance in adoption levels (R² = 0.6625), suggesting a good fit. Several independent variables are statistically significant at conventional levels. In particular, x₁, x₂, and x₃ have strong positive and highly significant effects (p < 0.001), indicating that these factors—likely key drivers such as ICT competency, digital skills, or access to training—are strongly associated with increased technology adoption. Variable x₅ is marginally significant (p = 0.0495), showing a small but meaningful positive impact. On the other hand, x₄, x₆, x₇, x₈, and x₉ are not statistically significant, suggesting their effects on adoption may be minimal or not distinguishable from zero in this model. Residuals are fairly symmetric with no extreme outliers, and the residual standard error of 0.3786 indicates relatively low unexplained variability.
+
+
+### Model Two: Spatial Durbin Model for Access
+
+#### Map of Access in different counties
+
+```{r}
+merged_clean_proj <- st_transform(data_merged, crs = 21037)
+
+ggplot(data = data_merged) +
+  geom_sf(aes(fill = y_11), color = "black") +
+  geom_sf_text(aes(label = NAME_2), size = 3, color = "black") +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(title = "Level of Access to New Technology by Subcounty in Nairobi",
+       fill = "Access") +
+  theme_minimal()
+```
+
+#### Moran's I Test before modeling
+
+```{r}
+moran_y11 <- moran.test(data_merged$y_11, lw)
+
+print(moran_y11)
+```
+The Moran’s I test for the second model, which has access to technology as the dependent variable (y_11), shows no significant spatial autocorrelation, with a Moran’s I statistic of -0.0075 and a high p-value of 1. This indicates that the spatial distribution of residuals is essentially random and does not exhibit clustering. Therefore, since spatial dependence is not present, it is not necessary to apply a Spatial Durbin Model (SDM). Instead, we proceed with an Ordinary Least Squares (OLS) regression to analyze the factors influencing access to technology.
+
+
+#### OLS Model for Access
+
+```{r}
+ols_access   <- lm(y_11 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+summary(ols_access)
+```
+
+The OLS model for access to technology shows a good fit, explaining 54% of the variation in the dependent variable. Key predictors such as x₁, x₂, and x₃ have strong and statistically significant positive effects, indicating they play a major role in improving access. Other variables like x₄, x₈, and x₉ are not significant and may have little influence. Since the Moran’s I test showed no spatial autocorrelation, using OLS is appropriate for this analysis.
+
+
+
+### Model Three: Spatial Durbin Model for Openness
+
+#### Map of Openness in different counties
+
+```{r}
+ggplot(data = data_merged) +
+  geom_sf(aes(fill = y_12), color = "black") +
+  geom_sf_text(aes(label = NAME_2), size = 3, color = "black") +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(title = "Level of Openness to Technology by Subcounty in Nairobi",
+       fill = "Openness") +
+  theme_minimal()
+```
+
+#### Moran's I Test before modeling
+
+```{r}
+moran_y12 <- moran.test(data_merged$y_12, lw)
+
+print(moran_y12)
+```
+
+Based on the Moran’s I test for the Openness model (y_12), the result shows no significant spatial autocorrelation (Moran’s I = -0.0021, p-value = 0.8615). This means that the residuals are randomly distributed in space, supporting the validity of using an OLS model for this variable as well, without the need for spatial regression methods.
+
+#### OlS Model for Openness
+
+```{r}
+ols_openness <- lm(y_12 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9, data = data_merged)
+summary(ols_openness)
+```
+
+The OLS results for the third model, where the dependent variable is openness, indicate a strong overall model fit (Adjusted R² = 0.5304, p < 2.2e-16). Key predictors such as x_1, x_2, and x_3 are highly significant and positively associated with openness. x_5 is also statistically significant at the 5% level, while x_9 shows marginal significance. Other variables (x_4, x_6, x_7, x_8) do not show significant effects.
+
+### Model Four: Spatial Durbin Model for Coping
+
+#### Map of Coping in different counties
+
+```{r}
+ggplot(data = data_merged) +
+  geom_sf(aes(fill = y_13), color = "black") +
+  geom_sf_text(aes(label = NAME_2), size = 3, color = "black") +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(title = "Level of Coping with Technology by Subcounty in Nairobi",
+       fill = "Coping") +
+  theme_minimal()
+```
+
+#### Moran's I Test before modeling
+
+
+```{r}
+moran_y13 <- moran.test(data_merged$y_13, lw)
+
+print(moran_y13)
+```
+
+The Moran’s I test for the fourth model, which examines coping levels, yields a highly significant result (Moran I = 0.0101, p < 2.2e-16), indicating strong positive spatial autocorrelation. This means that the coping levels of companies tend to cluster spatially across Nairobi’s sub-counties. Given this significant spatial dependency, it is necessary to use a Spatial Durbin Model (SDM) to properly account for these spatial effects in the analysis.
+
+#### SDM Model
+
+```{r}
+sdm_coping <- lagsarlm(
+  y_13 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 + x_9,
+  data = data_merged,
+  listw = lw,
+  type = "mixed"
+)
+
+summary(sdm_coping)
+```
+
+Some of the independent variables and lags are not significant, which spoil our model results. We make another model with the significant lags and variables.
+
+
+### SDM model with significant variables and lags
+
+```{r}
+sdm_coping_reduced <- lagsarlm(
+  y_13 ~ x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_8,
+  data = data_merged,
+  listw = lw,
+  type = "mixed",
+  Durbin = ~ x_2 + x_4 + x_5 + x_6 + x_8
+)
+
+summary(sdm_coping_reduced)
+
+```
+
+The Spatial Durbin Model (SDM) for Level of Coping with Modern Technology (Coping) reveals that several factors significantly influence coping both directly and through spatial spillovers. The variables ICT Competency (x_1), Willingness to Continuous Training (x_2), and Mastering Digital Transformation (x_3) all have highly significant direct effects (p < 0.001), showing they positively affect how SMEs cope with modern technology. Among the spatially lagged variables, lag.Willingness to Continuous Training (lag.x_2), lag.New Technology Use among Employees (lag.x_4), lag.Employees with Technical Skills (lag.x_5), lag.Operational Mode (lag.x_6), and lag.Financial Institutions as Main Financiers (lag.x_8) are all statistically significant (p < 0.001), indicating strong spatial dependencies. This suggests that the coping level in a given SME is also influenced by how neighboring SMEs perform in these areas. The significant LR test (p = 0.0017) and rho (p < 0.001) confirm the model’s spatial relevance. These findings justify the use of SDM over non-spatial models like OLS, as spatial autocorrelation is clearly present and meaningful.
+
+Additionally comparing the AIC of our SDM model which is 1139.2 with the one of OLS(1177.026), we conclude that SDM is a better model for our data.
+
+
+
+#### Direct, Indirect, and Total effects from the SDM model
+
+```{r}
+impacts_coping <- impacts(sdm_coping_reduced, listw = lw, R = 1000)
+summary(impacts_coping, zstats = TRUE)
+```
+
+
+
+
+
+#### SDM Impacts Visualization
+
+```{r}
+impacts_df_coping <- as.data.frame(impacts_coping$res)
+
+impacts_long_coping <- impacts_df_coping %>%
+  rownames_to_column("Variable") %>%
+  pivot_longer(cols = -Variable, names_to = "ImpactType", values_to = "Effect")
+
+impacts_long_coping$Variable <- factor(impacts_long_coping$Variable, levels = unique(impacts_long_coping$Variable))
+
+ggplot(impacts_long_coping, aes(x = Variable, y = Effect, fill = ImpactType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "SDM Impacts: Direct, Indirect, and Total Effects (Coping)",
+    x = "Variable",
+    y = "Impact Size",
+    fill = "Impact Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+
+```
+
+From the impact analysis of the SDM model, Employees with New Technology (x_4) and Operational Mode (x_6) emerge as the variables with the highest indirect and total impacts on the level of coping with modern technology. This indicates that changes in these factors not only influence a firm's coping ability directly but also significantly affect neighboring firms through spatial spillovers. In particular, SMEs located near others with a higher presence of employees using new technology or operating both online and physically tend to benefit indirectly, likely through knowledge diffusion, competition, or collaborative practices. This highlights the importance of regional clusters and interconnected business environments in enhancing technology adoption and coping capacity across SMEs.
+
+
+
+## Conclusion
+
+
+In conclusion, across the four models developed in this project, we first applied the Moran’s I test to assess spatial autocorrelation. The test results indicated that there was no significant spatial dependence in the first three models, justifying the use of Ordinary Least Squares (OLS) for those cases. However, for the fourth model—focusing on the level of coping with modern technology—we detected spatial dependence and therefore applied the Spatial Durbin Model (SDM). The SDM outperformed the OLS model for this case, offering a deeper understanding by incorporating spatial lags. This allowed us to uncover both direct and indirect effects, revealing which variables not only influence the dependent variable within a firm but also across neighboring firms. Overall, the use of spatial modeling proved essential in fully capturing the dynamics of technological adaptation.
+
+
+
+
+
